@@ -16,11 +16,13 @@ import { repos } from "@repo/db";
 import {
   HOST_CHANNEL_UNAFFECTED,
   HostUnreachableError,
+  resolveWorkload,
   safeErrorMessage,
   type DeployTarget,
   type RuntimeMode,
 } from "@repo/core";
 import { env } from "../config";
+import { isRealContainerRef } from "./container-ref";
 import { cloudClient, getOrgCloudToken } from "./cloud/client";
 import { resolveOrgCloudUserId } from "./cloud/transport";
 import { platform } from "./controller-helpers";
@@ -108,6 +110,9 @@ export interface DeploymentMeta {
    * agree on one path.
    */
   staticServeOutputDir?: string;
+  /** Compose roll-up. Loosely typed on purpose — the pipeline writes a wider
+   *  object than any one reader needs. */
+  composeDeployment?: { warningMessage?: string } & Record<string, unknown>;
 }
 
 /**
@@ -131,9 +136,15 @@ export interface DeploymentMeta {
  */
 export function resolveDeploymentStaticRoot(
   deployment: Pick<Deployment, "containerId" | "meta">,
-  project: { hasServer?: boolean | null; outputDirectory?: string | null },
+  project: { hasServer?: boolean | null; workloadType?: string | null; outputDirectory?: string | null },
 ): string | null {
-  if (project.hasServer || !deployment.containerId) return null;
+  // Only a STATIC workload serves a release directory. A worker also has
+  // `hasServer=false` but its containerId is a real container, not a doc-root, so
+  // classify by workload — not the legacy boolean — or a worker's stop/start would
+  // dial a bogus static path (#538-B).
+  if (resolveWorkload(project.workloadType, project.hasServer) !== "static" || !deployment.containerId) {
+    return null;
+  }
   const meta = (deployment.meta ?? {}) as DeploymentMeta;
   const outputDirectory = meta.staticServeOutputDir ?? project.outputDirectory ?? "";
   try {
@@ -784,7 +795,9 @@ export async function deploymentContainerIds(
   const rows = await repos.service.listByDeployment(dep.id);
   const serviceIds = [...new Set(rows.map((r) => r.containerId).filter((id): id is string => !!id))];
   if (serviceIds.length > 0) return serviceIds;
-  return dep.containerId ? [dep.containerId] : [];
+  // The compose sentinel is a marker, not a container: returning it made a pause
+  // report success having stopped nothing (docker 404 → `isAbsent` → swallowed).
+  return isRealContainerRef(dep.containerId) ? [dep.containerId] : [];
 }
 
 /**

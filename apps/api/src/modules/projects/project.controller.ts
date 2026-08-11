@@ -18,6 +18,7 @@ import {
   isLoopbackHost,
   isReservedLoopbackPort,
   pickCanonicalDomainRow,
+  pickPrimaryServiceId,
   resolveProjectAccess,
 } from "../../lib/public-endpoints";
 import {
@@ -52,6 +53,7 @@ import { resolveDeploymentRuntimeForRead } from "../../lib/deployment-runtime";
 import { getOpenRestyPaths } from "@/lib/openresty-paths";
 import * as domainService from "../domains/domain.service";
 import * as prepareService from "../deployments/prepare.service";
+import { deploymentWorkload } from "../deployments/deployment-class";
 import { sshManager } from "../../lib/ssh-manager";
 import { env } from "../../config";
 import { domainWebhookUrl } from "../../lib/public-url";
@@ -1792,8 +1794,22 @@ async function reRegisterDomainRoute(
 
     // Find the service deployment to get the container target. Prefer a row with
     // a container to inspect — a stored ip alone is just the last-known value.
+    //
+    // Via the same picker the access URL uses: these rows come back in insertion
+    // (dependency) order, so the first one with a container was the database (#498).
     const svcDeps = await repos.service.listByDeployment(project.activeDeploymentId);
-    const primarySvc = svcDeps.find((s) => s.containerId) ?? svcDeps.find((s) => s.ip);
+    const [projectServices, domainRows] = await Promise.all([
+      repos.service.listByProject(project.id).catch(() => []),
+      repos.domain.listByProject(project.id).catch(() => []),
+    ]);
+    const primaryId = pickPrimaryServiceId(
+      projectServices.filter((s) => s.enabled),
+      domainRows,
+    );
+    const primarySvc =
+      svcDeps.find((s) => s.serviceId === primaryId && (s.containerId || s.ip)) ??
+      svcDeps.find((s) => s.containerId) ??
+      svcDeps.find((s) => s.ip);
     if (!primarySvc) return;
 
     // The port the app LISTENS on. `hostPort` is a publish, not a container port,
@@ -2075,6 +2091,11 @@ export async function getInfo(c: Context) {
   // (which already fetches `latest`) does show. One query on a detail read.
   const latestDeployment = await repos.deployment.findLatestByProject(id).catch(() => null);
   const hasServer = project.hasServer ?? project.productionMode === "host";
+  // The resolved runtime workload (web | worker | static). A worker and a web app
+  // both run a long-lived process (start command + volumes), but only a web app
+  // listens on a port; a static site does neither (#538-B).
+  const workloadType = deploymentWorkload(project);
+  const runsProcess = workloadType !== "static";
   const serviceRows = await repos.service.listByProject(id);
   const serviceCount = serviceRows.length;
   // Deployment shape, derived from the service rows (kind-discriminated) — not a
@@ -2098,9 +2119,10 @@ export async function getInfo(c: Context) {
     outputDirectory: project.outputDirectory ?? "",
     productionPaths: project.productionPaths ?? "",
     installCommand: project.installCommand ?? "",
-    startCommand: hasServer ? (project.startCommand ?? "") : "",
-    productionPort: hasServer ? String(project.port ?? 3000) : "",
+    startCommand: runsProcess ? (project.startCommand ?? "") : "",
+    productionPort: workloadType === "web" ? String(project.port ?? 3000) : "",
     hasServer,
+    workloadType,
     hasBuild: project.hasBuild ?? true,
     rootDirectory: project.rootDirectory ?? "./",
     // Two fields, because "" and "inherits the framework default" are different
@@ -2108,7 +2130,7 @@ export async function getInfo(c: Context) {
     // `resolvedVolumes` is what a deploy would actually mount, so the editor can
     // show the inherited value as a placeholder instead of pretending it's unset.
     volumes: (project.volumes as string[] | null) ?? null,
-    resolvedVolumes: hasServer
+    resolvedVolumes: runsProcess
       ? resolveProjectVolumes(project.volumes as string[] | null, project.framework)
       : [],
     isLoading: false,

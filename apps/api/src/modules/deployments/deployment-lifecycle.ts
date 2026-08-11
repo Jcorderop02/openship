@@ -71,7 +71,7 @@ export interface LifecycleContext {
    * through onFailure — that inverts a working deploy and tears down its
    * containers.
    */
-  settled?: "ready" | "failed" | "cancelled" | "reconciling";
+  settled?: "ready" | "failed" | "cancelled" | "reconciling" | "no_changes";
 }
 
 /** Build the persistable log array. Collapsing/sanitizing it is observability
@@ -180,7 +180,7 @@ async function recordOutcome(
   status: string,
   extra: Partial<NewDeployment>,
   sheddable: ReadonlyArray<keyof NewDeployment> = [],
-): Promise<string | null> {
+): Promise<{ state: "applied" | "refused" | "failed"; error: string | null }> {
   const attempts: Array<{ label: string; extra: Partial<NewDeployment> }> = [
     { label: "", extra },
   ];
@@ -194,14 +194,18 @@ async function recordOutcome(
   let lastError = "";
   for (const [index, attempt] of attempts.entries()) {
     try {
-      await repos.deployment.updateStatus(depId, status, attempt.extra);
+      const applied = await repos.deployment.updateStatus(depId, status, attempt.extra);
       if (index > 0) {
         console.error(
           `[deployment-lifecycle] ${depId}: recorded "${status}" ${attempt.label} — ` +
             `the rejected payload was dropped: ${lastError}`,
         );
       }
-      return null;
+      // ONLY an explicit `false` is a refusal (the row is already cancelled).
+      // Inferring one from any falsy return would turn a successful deploy into a
+      // cancelled one the moment a caller's stub — or a future impl — returns
+      // nothing. "refused" suppresses the success; "failed" must not.
+      return { state: applied === false ? "refused" : "applied", error: null };
     } catch (err) {
       lastError = safeErrorMessage(err);
     }
@@ -209,7 +213,9 @@ async function recordOutcome(
   console.error(
     `[deployment-lifecycle] ${depId}: could not record outcome "${status}": ${lastError}`,
   );
-  return lastError;
+  // The write failed outright. The deploy still SUCCEEDED, so the caller reports
+  // ready with an explanation rather than inverting a working deploy.
+  return { state: "failed", error: lastError };
 }
 
 export async function cleanupBuildArtifact(
@@ -263,7 +269,11 @@ export async function setDeploymentStatus(
     };
   },
 ): Promise<void> {
-  await repos.deployment.updateStatus(deploymentId, dbStatus, opts?.extra);
+  const applied = await repos.deployment.updateStatus(deploymentId, dbStatus, opts?.extra);
+  // An explicit `false` means the row is already cancelled and stayed that way.
+  // Broadcasting anyway would tell the UI the deploy the user stopped is still
+  // moving. Any other return counts as applied — see recordOutcome.
+  if (applied === false) return;
   sessionManager.updateStatus(
     deploymentId,
     opts?.sse?.status ?? (dbStatus as BuildSessionState["status"]),
@@ -303,6 +313,76 @@ export async function onReconciling(
     warningMessage:
       result.warningMessage ?? "Connection lost during deploy — verifying remote state.",
   });
+}
+
+/**
+ * NO-OP completion: a compose deploy that carried EVERY service forward, so it
+ * built, created and probed nothing (`composeDeployMadeNoChanges`).
+ *
+ * Like onReconciling and unlike onSuccess: does NOT advance the active pointer and
+ * does NOT record a container. The CURRENT active deployment still owns the live
+ * containers and the image they run; this row owns nothing, so promoting it would
+ * make an empty release the newest `ready` one and a rollback target.
+ *
+ * Tears nothing down, deliberately: `onFailure` and `onCancelled` both destroy the
+ * deployment's service containers, and the containers listed under THIS row are
+ * the ones still serving.
+ */
+export async function onNoChanges(
+  ctx: LifecycleContext,
+  result: { warningMessage?: string; durationMs?: number },
+): Promise<void> {
+  const { project, buildSessionId, dep } = ctx;
+
+  const collapsed = collectLogs(ctx);
+  const reason =
+    result.warningMessage ??
+    "No changes to deploy — every service was already up to date, so the current release stayed live.";
+  // Under `composeDeployment.warningMessage` because that is where the build-status
+  // refresh path reads a persisted deploy note from. Sanitized like onSuccess's
+  // meta — a NUL in the reason must not fail the write.
+  const previousMeta = (dep.meta as DeploymentMeta | null) ?? {};
+  const mergedMeta = sanitizeStorableStrings({
+    ...previousMeta,
+    composeDeployment: { ...(previousMeta.composeDeployment ?? {}), warningMessage: reason },
+  });
+  await recordOutcome(dep.id, "no_changes", { errorMessage: null, meta: mergedMeta }, ["meta"]);
+  ctx.settled = "no_changes";
+  // The SSE layer has no third terminal state, so the stream closes "ready" and
+  // the dashboard reads `no_changes` off the row (same split as onReconciling).
+  await finishSession(buildSessionId, "ready", result.durationMs ?? 0, collapsed);
+  sessionManager.updateStatus(dep.id, "ready", { warningMessage: reason });
+
+  notification.emit({
+    organizationId: dep.organizationId,
+    eventType: "deployment.no_changes",
+    resourceType: "deployment",
+    resourceId: dep.id,
+    payload: {
+      projectName: project.name,
+      branch: dep.branch,
+      commitSha: dep.commitSha,
+      durationMs: result.durationMs,
+      message: reason,
+    },
+  });
+
+  audit.recordAsync(
+    { organizationId: dep.organizationId, actorUserId: null, source: "system" },
+    {
+      eventType: "deployment.no_changes",
+      resourceType: "deployment",
+      resourceId: dep.id,
+      before: { status: dep.status },
+      after: {
+        status: "no_changes",
+        projectId: project.id,
+        branch: dep.branch,
+        commitSha: dep.commitSha,
+        durationMs: result.durationMs,
+      },
+    },
+  );
 }
 
 export async function onFailure(
@@ -556,12 +636,30 @@ export async function onSuccess(
   // deploy that worked.
   const version = await readReleaseVersion(project.id, dep.commitSha);
 
-  const outcomeError = await recordOutcome(
+  const outcome = await recordOutcome(
     dep.id,
     "ready",
     { errorMessage: null, meta: mergedMeta, version },
     ["meta"],
   );
+  const outcomeError = outcome.error;
+
+  // The row refused the write because it is already cancelled: the user stopped
+  // this deploy while it was in the deploy phase, which is not cancellable, so it
+  // ran to completion anyway. Everything below publishes a SUCCESS — the active
+  // release pointer above all — and none of it may happen for a deployment that
+  // was cancelled. cancelBuildSession already tore down what it provisioned and
+  // already broadcast `cancelled`, so this returns silently rather than emitting
+  // a second terminal event.
+  if (outcome.state === "refused") {
+    console.warn(
+      `[deployment-lifecycle] ${dep.id}: deploy finished after the user cancelled it; ` +
+        `leaving the row cancelled and NOT advancing the active release`,
+    );
+    ctx.settled = "cancelled";
+    await finishSession(buildSessionId, "cancelled", result.durationMs, collectLogs(ctx));
+    return;
+  }
 
   // From here the deployment ROW says ready: the outcome is recorded, so
   // nothing below may be allowed to turn it into a failure.

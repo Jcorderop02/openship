@@ -36,7 +36,6 @@ import {
   isHostChannelUnavailableError,
   runDeployPipeline,
   isMultiServiceRuntime,
-  waitForReady,
   ensureEdge,
 } from "@repo/adapters";
 import { platform } from "../../lib/controller-helpers";
@@ -50,6 +49,7 @@ import {
   resolveEffectiveTarget,
   hostChannelDeployNotice,
 } from "../../lib/deployment-runtime";
+import { isRealContainerRef } from "../../lib/container-ref";
 import { ensureRoutingReady } from "../../lib/edge-reconcile";
 import { sshManager } from "../../lib/ssh-manager";
 import {
@@ -58,6 +58,8 @@ import {
   type DeployRouting,
 } from "./build-execution-plan";
 import { attachLinkedNetworks } from "./attach-linked-networks";
+import { resolveReadinessTarget } from "./readiness-target";
+import { waitForReadyFromExecutor } from "./forwarded-readiness";
 import { syncProjectToServerManifest } from "../../lib/openship-manifest-sync";
 import { syncManagedEdgeRoutes, edgeUnsyncedWarning } from "../../lib/managed-edge-proxy";
 import { decryptEnvMap } from "../../lib/encryption";
@@ -89,6 +91,7 @@ import { resolveReadinessGate, runReadinessGate, type ResolvedReadinessGate } fr
 import { auditStaticOutput, staticOutputTargets } from "./output-audit.service";
 import { createBuildConfig } from "./build-config";
 import { pinnedAppImage, pinnedStaticDir, snapshotNeedsGitSource } from "./pinned-artifacts";
+import { snapshotToClass } from "./deployment-class";
 import { shouldRetainArtifact } from "./rollback/restore-plan";
 import { resolveClonePlan } from "./clone-plan";
 import { collapseTerminalLogs } from "./terminal-logs";
@@ -234,7 +237,7 @@ async function markDeploymentFailedFromOutside(deploymentId: string, error: unkn
   try {
     const dep = await repos.deployment.findById(deploymentId).catch(() => null);
     if (!dep) return;
-    if (["failed", "ready", "cancelled", "action_required"].includes(dep.status)) {
+    if (["failed", "ready", "cancelled", "action_required", "no_changes"].includes(dep.status)) {
       // Inner onFailure already ran (or the deploy somehow succeeded). Nothing to do.
       // `action_required` counts as "already ran": onFailure wrote it deliberately
       // along with the blocker's code + details, and this function's blind
@@ -506,8 +509,12 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // persisted "docker" would make rollback/purge 404-no-op on the release dir and
     // leak it). Cloud static + Docker-less desktop-local static keep their own mode.
     const willRunServices = (await resolveServicePipelineMode(project, snapshot)).useServicePipeline;
+    // The runtime/workload axis, resolved from the frozen snapshot triple
+    // (issue #538). `web` | `worker` | `static` replaces the old `hasServer`
+    // boolean, which couldn't tell a portless worker from a static site.
+    const workload = snapshotToClass(snapshot).workload;
     const runtimeModes = resolveBuildRuntimeModes({
-      hasServer: !!snapshot.hasServer,
+      workload,
       serverId: snapshot.serverId,
       baseTarget: plat.target,
       effectiveTarget: resolveEffectiveTarget(plat.target, snapshot),
@@ -546,7 +553,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // Build + deploy routing, keyed off the RESOLVED runtime (ground truth) — this
     // is the one place the old scattered `instanceof` checks now live.
     const deployRouting = resolveDeployRouting({
-      hasServer: !!snapshot.hasServer,
+      workload,
       runtimeName: runtime.name,
       outputDirectory: snapshot.outputDirectory,
     });
@@ -564,11 +571,13 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       `→ Deploy target: ${resolved.effectiveTarget}` +
         (resolved.serverId ? ` (server ${resolved.serverId.slice(0, 8)})` : "") +
         ` · runtime: ${
-          !snapshot.hasServer
+          workload === "static"
             ? "static (built in a Docker sandbox, served as files by the edge)"
-            : resolved.runtimeMode === "docker"
-              ? "sandboxed (Docker container)"
-              : "direct (host process)"
+            : workload === "worker"
+              ? "worker (supervised container, no port, no route)"
+              : resolved.runtimeMode === "docker"
+                ? "sandboxed (Docker container)"
+                : "direct (host process)"
         }\n`,
     );
 
@@ -806,8 +815,10 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       gitToken: gitCred.token,
     });
     // A static app builds via the minimal nginx image (generateStaticDockerfile);
-    // only this flag selects it. Bare builds ignore it.
-    buildConfig.isStatic = !snapshot.hasServer;
+    // only this flag selects it. Bare builds ignore it. A worker also has
+    // hasServer=false but must build its OWN image, not the static nginx one —
+    // so key strictly off the static workload, not `!hasServer` (issue #538-B).
+    buildConfig.isStatic = workload === "static";
     // Folder-upload cloud deploy: the browser uploaded the source straight into
     // a pre-provisioned workspace — adopt it and skip clone + transfer. (The
     // self-hosted upload path instead rides snapshot.localPath, handled above.)
@@ -1435,6 +1446,11 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
   // where /opt/openship/static is the one bind mount the api container, the edge and
   // the host all see, so no host channel is in the path (`sharedMountExecutor`).
   const isStaticFileServe = phase.deployRouting.deployMode === "static-file-serve";
+  // A worker is a running container like a server, but portless: no host port to
+  // pin, no readiness dial, no route (issue #538-B). It reuses the server variant's
+  // lifecycle (deploy + attach linked networks + restart:always) with the
+  // port/route/readiness seams stubbed out below.
+  const isWorker = phase.deployRouting.deployMode === "worker";
   const staticServeRuntime = isStaticFileServe
     ? new BareRuntime({
         workDir: STATIC_RELEASE_BASE,
@@ -1467,7 +1483,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
   // running-process divergence (restart/overlap, preflight, activate, route,
   // health). buildDeployEnvironment composes the pipeline env from it; the shared
   // edge/routing orchestration stays there (not duplicated per strategy).
-  const serve: ServeStrategy = isStaticFileServe
+  const baseServe: ServeStrategy = isStaticFileServe
     ? {
         restartPolicy: "no",
         canOverlap: false,
@@ -1576,25 +1592,12 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
         },
         resolveRoute: undefined,
         readiness: async (containerId, cfg) => {
-          let host = "127.0.0.1";
-          // An explicit `readiness.port` overrides; otherwise probe the app port
-          // and let the container-runtime lookup below remap it to the published one.
-          let port = readinessGate.probe.port ?? cfg.port;
-          if (runtime.name !== "bare" && readinessGate.probe.port === undefined) {
-            // Container runtime: prefer the published host port; fall back to the
-            // container's bridge IP:port (reachable on the local daemon).
-            try {
-              const info = await runtime.getContainerInfo(containerId);
-              if (info?.hostPort) {
-                port = info.hostPort;
-              } else if (runtime.supports("containerIp")) {
-                const ip = await runtime.getContainerIp(containerId);
-                if (ip) host = ip;
-              }
-            } catch {
-              /* fall back to 127.0.0.1:cfg.port */
-            }
-          }
+          const { host, port } = await resolveReadinessTarget({
+            runtime,
+            containerId,
+            primaryPort: cfg.port,
+            probePort: readinessGate.probe.port,
+          });
           // Name the address actually dialed. Reporting `cfg.port` here sent
           // operators to look at the app's own port (3000) when the probe had
           // really been talking to the published host port, so a wrong-port or
@@ -1605,11 +1608,25 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
             `Health check: waiting up to ${seconds}s for the app to answer at ${target}` +
               `${readinessGate.probe.path ? "" : " (TCP connect)"}…\n`,
           );
-          const ready = await waitForReady(host, port, {
-            path: readinessGate.probe.path,
-            timeoutMs: readinessGate.probe.timeoutMs,
-            intervalMs: readinessGate.probe.intervalMs,
-          });
+          let ready: boolean;
+          try {
+            // A containerized OpenShip API has its own loopback/network namespace.
+            // Probe from the host through the same pooled SSH channel used for
+            // local host operations; a non-containerized install transparently
+            // falls back to the executor process's direct socket path.
+            ready = await sshManager.withHostExecutor((executor) =>
+              waitForReadyFromExecutor(executor, host, port, {
+                path: readinessGate.probe.path,
+                timeoutMs: readinessGate.probe.timeoutMs,
+                intervalMs: readinessGate.probe.intervalMs,
+              }),
+            );
+          } catch (error) {
+            return (
+              `OpenShip could not probe ${target} from the deployment host: ` +
+              `${safeErrorMessage(error)}. Check the local host-control channel.`
+            );
+          }
           if (!ready) {
             return (
               `The app never answered at ${target} within ${seconds}s` +
@@ -1623,10 +1640,26 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
         },
       };
 
+  // A worker serves through the running-process lifecycle (baseServe, since
+  // `isStaticFileServe` is false for deployMode "worker") but publishes no port
+  // and exposes no route. Stub the port/route/readiness seams: `ensurePorts`
+  // has nothing to check, there's no port to dial for readiness, and overlap is
+  // off so two instances never double-consume a queue during a swap.
+  const serve: ServeStrategy = isWorker
+    ? {
+        ...baseServe,
+        canOverlap: false,
+        ensurePorts: async () => {},
+        resolveRoute: undefined,
+        readiness: undefined,
+      }
+    : baseServe;
+
   let pinnedHostPort: number | undefined = project.hostPort ?? undefined;
   if (
     routeStrategy === "loopback-port" &&
     !isStaticFileServe &&
+    !isWorker &&
     runtime.name !== "bare" &&
     phase.effectiveTarget !== "cloud"
   ) {
@@ -1687,6 +1720,9 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     imageRef: buildResult.imageRef!,
     environment: dep.environment,
     port: snapshot.port,
+    // A worker publishes and dials nothing: the runtime skips ExposedPorts /
+    // PortBindings / PORT (issue #538-B). `port` is left set but inert.
+    portless: isWorker,
     hostPort: pinnedHostPort,
     // The build may override the start command once it knows the output shape
     // (e.g. Next.js standalone → `node server.js` instead of `next start`).
@@ -1849,7 +1885,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
       .listByDeployment(prevDep.id)
       .catch(() => []);
     for (const sd of prevServiceDeps) {
-      if (!sd.containerId || sd.containerId === "compose" || sd.containerId === prevDep.containerId) {
+      if (!isRealContainerRef(sd.containerId) || sd.containerId === prevDep.containerId) {
         continue;
       }
       try {

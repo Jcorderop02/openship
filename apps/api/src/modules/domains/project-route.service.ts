@@ -13,6 +13,7 @@ import {
 } from "../../lib/public-endpoints";
 import { assertValidCustomDomain, assertValidCustomDomains } from "../../lib/custom-domain-guard";
 import { resolveLiveUpstreamUrl, resolveRouteStrategy } from "../../lib/upstream-url";
+import { isRealContainerRef } from "../../lib/container-ref";
 import { deregisterManagedEdgeRoutes, syncManagedEdgeRoutes } from "../../lib/managed-edge-proxy";
 import { syncProjectPublicRoutes } from "../../lib/project-route-store";
 import { resolveRouteRedirect } from "../../lib/domain-redirect";
@@ -326,9 +327,12 @@ export async function reapplyProjectLiveRoutes(
     | "organizationId"
     | "webhookDomain"
     | "routeStrategy"
-    // Needed to re-emit a STATIC route live (see resolveLiveStaticRoot): a
+    // Needed to re-emit a STATIC route live (see resolveDeploymentStaticRoot): a
     // path-targeted domain serves files, so it needs a doc root, not an upstream.
+    // `workloadType` rides along so the static-root resolver can tell a worker
+    // (hasServer=false, but a real container) apart from a static site (#538-B).
     | "hasServer"
+    | "workloadType"
     | "outputDirectory"
     // Carries `proxy` (upload limit, timeouts) through to reconcileProjectRoutes,
     // so raising a limit applies on save instead of waiting for a redeploy.
@@ -448,11 +452,13 @@ export async function reapplyProjectLiveRoutes(
     };
 
     const containerId = deployment.containerId;
-    if (!containerId) {
-      // Compose/multi-service deployments track containers per-service, so the
-      // parent deployment row has no containerId — nothing to point a single-app
-      // route at (per-service routes are handled in updateService). Still tear
-      // down any dropped hostnames on the correct host.
+    if (!isRealContainerRef(containerId)) {
+      // The `"compose"` sentinel means the release has no single upstream to point a
+      // project-level route at (per-service routes are handled in updateService). A
+      // REAL primary container is routed below — it is the container the project's
+      // canonical URL resolves to, which is what `primaryContainerId` now guarantees.
+      // Testing only for null sent the sentinel down that path as a container id.
+      // Still tear down any dropped hostnames on the correct host.
       console.warn(
         `[project-route] ${project.slug}: deployment ${deployment.id} has no containerId (target=${effectiveTarget}) — skipping single-app route registration`,
       );

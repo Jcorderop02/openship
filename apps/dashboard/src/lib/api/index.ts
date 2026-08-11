@@ -40,6 +40,7 @@ export type { AppCatalogEntry, AppCatalogField, InstallAppResult } from "./apps"
 export { deployApi } from "./deploy";
 export type { RestorePlanUI } from "./deploy";
 export { domainsApi } from "./domains";
+export { dnsApi, type DnsProviderDescriptor, type SanitizedDnsCredential, type AddDnsCredentialInput, type VerifyZoneResult } from "./dns";
 export {
   jobsApi,
   type JobView,
@@ -53,7 +54,7 @@ export {
   type BackupScheduleView,
 } from "./jobs";
 export { tokensApi } from "./tokens";
-export type { AccessToken, CreatedAccessToken, McpClient } from "./tokens";
+export type { AccessToken, CreatedAccessToken, McpClient, McpClientDetail } from "./tokens";
 export { githubApi } from "./github";
 export type { RepoTreeEntry } from "./github";
 export { iconsApi } from "./icons";

@@ -28,7 +28,9 @@ import { BuildLogger } from "@repo/adapters";
 import type { BuildConfigSnapshotLike } from "../build-config";
 import {
   cleanupBuildArtifact,
+  onCancelled,
   onFailure,
+  onNoChanges,
   onReconciling,
   onSuccess,
   routeIssuesWarning,
@@ -39,7 +41,8 @@ import type { DeployableService } from "../../../lib/deployable-service";
 import { webhookProxyTarget } from "../../../config";
 
 import { buildComposeImages } from "./build.service";
-import { deployComposeServices } from "./deploy.service";
+import { composeDeployMadeNoChanges, deployComposeServices } from "./deploy.service";
+import { COMPOSE_SENTINEL } from "../../../lib/container-ref";
 import { safeErrorMessage } from "@repo/core";
 import * as sessionManager from "../session-manager";
 
@@ -141,6 +144,20 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     refreshServiceIds,
   });
 
+  // Cancelled during the image phase: stop here. setDeploymentStatus below has no
+  // terminal-state guard, so without this the cancelled row would be flipped back
+  // to "deploying" and the services the user cancelled would start anyway.
+  if (composeBuild.cancelled) {
+    for (const [serviceId, imageRef] of composeBuild.builtImageRefs) {
+      await cleanupBuildArtifact(runtime, imageRef).catch((err) => {
+        const detail = safeErrorMessage(err);
+        logger.log(`Warning: failed to clean up built service image ${serviceId}: ${detail}\n`, "warn");
+      });
+    }
+    await onCancelled(ctx, composeBuild.durationMs);
+    return;
+  }
+
   if (composeBuild.buildFailures.size > 0) {
     logger.log(
       `Build phase completed with ${composeBuild.buildFailures.size} failed service image${composeBuild.buildFailures.size === 1 ? "" : "s"}. Deploying available services...\n`,
@@ -181,9 +198,8 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
   // running fine. Persist `reconciling` and leave the images in place (reconcile
   // may confirm ready; cleaning up now would hit the same dead connection).
   if (composeResult.status === "reconciling") {
-    const primary = composeResult.services.find((s) => s.containerId);
     await onReconciling(ctx, {
-      containerId: primary?.containerId,
+      containerId: composeResult.primaryContainerId,
       warningMessage:
         composeResult.warning ?? "Connection lost during deploy — verifying remote state.",
     });
@@ -214,7 +230,6 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     });
   }
 
-  const primary = composeResult.services.find((s) => s.containerId);
   // Routing failures are best-effort (domains are optional — never fail the
   // deploy). Fold them into the SAME top-level "action required" signal the
   // single-app pipeline uses (`edgeUnsynced` + `deployWarning` → routingUnsynced
@@ -224,8 +239,22 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     : undefined;
   const successWarning = routingWarning ?? composeResult.warning;
   sessionManager.broadcastInstallPhase(dep.id, { id: "ready", status: "done" });
+
+  // Every service was carried forward: this row owns no container and no image, so
+  // promoting it would point the project at an empty release and offer it as a
+  // rollback target (#498). Settle it without advancing. NOT via onFailure /
+  // onCancelled — both destroy the deployment's service containers, which here are
+  // the live ones still serving.
+  if (composeDeployMadeNoChanges(composeResult)) {
+    await onNoChanges(ctx, {
+      warningMessage: successWarning,
+      durationMs: composeBuild.durationMs,
+    });
+    return;
+  }
+
   await onSuccess(ctx, {
-    containerId: primary?.containerId ?? "compose",
+    containerId: composeResult.primaryContainerId ?? COMPOSE_SENTINEL,
     url: composeResult.publicUrl,
     durationMs: composeBuild.durationMs,
     warningMessage: successWarning,

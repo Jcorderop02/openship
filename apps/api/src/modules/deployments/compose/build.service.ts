@@ -296,6 +296,12 @@ export interface ComposeBuildImagesResult {
   buildFailures: Map<string, string>;
   /** Count of image-only (external) services included in imageRefs */
   externalCount: number;
+  /**
+   * At least one service build came back "cancelled" (the user cancelled the
+   * deployment). Distinct from buildFailures: the caller must stop WITHOUT
+   * marking the deployment failed.
+   */
+  cancelled: boolean;
   durationMs: number;
 }
 
@@ -330,6 +336,7 @@ export async function buildComposeImages(opts: {
   const imageRefs = new Map<string, string>();
   const builtImageRefs = new Map<string, string>();
   const buildFailures = new Map<string, string>();
+  const cancelledServices = new Set<string>();
   const startedAt = Date.now();
 
   // Buildable = anything that needs a per-service image build.
@@ -590,6 +597,24 @@ export async function buildComposeImages(opts: {
 
     // Record a per-service build result: image refs / failures + status broadcast.
     const applyBuildResult = (service: Service, buildResult: BuildResult) => {
+      // Cancelled ≠ failed: tracked separately so the pipeline can stop without
+      // recording a build failure on the deployment. The per-service SSE status
+      // union has no "cancelled" member, so the tab reports the reason instead of
+      // being left spinning on "building".
+      if (buildResult.status === "cancelled") {
+        cancelledServices.add(service.id);
+        opts.logger.log(`Compose service "${service.name}" build cancelled\n`, "info", {
+          serviceName: service.name,
+        });
+        sessionManager.broadcastServiceStatus(opts.dep.id, {
+          serviceName: service.name,
+          serviceId: service.id,
+          status: "failed",
+          error: "Build cancelled",
+        });
+        return;
+      }
+
       if (buildResult.status === "failed" || !buildResult.imageRef) {
         const failureMessage =
           buildResult.errorMessage ?? `Failed to build service "${service.name}"`;
@@ -665,7 +690,15 @@ export async function buildComposeImages(opts: {
       );
     }
 
-    if (buildable.length > 0) {
+    // Non-empty only for services derived from `buildable`, so it implies there was
+    // something to build.
+    if (cancelledServices.size > 0) {
+      // "failed" is the closest step state there is — BuildLogger has no cancelled
+      // one — but no install phase is marked done: the deployment's own cancelled
+      // status is the outcome the user is waiting on.
+      opts.logger.step("build", "failed", "Image build cancelled");
+      opts.logger.log("Compose image build cancelled. Deployment will not continue.\n", "error");
+    } else if (buildable.length > 0) {
       // Count of images actually BUILT (builtImageRefs is set only on a build) —
       // not imageRefs.size, which also holds external/pull + handed-over images.
       const succeeded = builtImageRefs.size;
@@ -710,6 +743,7 @@ export async function buildComposeImages(opts: {
     builtImageRefs,
     buildFailures,
     externalCount: external.length,
+    cancelled: cancelledServices.size > 0,
     durationMs: Date.now() - startedAt,
   };
 }

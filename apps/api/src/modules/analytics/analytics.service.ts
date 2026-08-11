@@ -19,6 +19,7 @@ import { repos } from "@repo/db";
 import { NotFoundError, AppError, safeErrorMessage } from "@repo/core";
 import type { ResourceUsage } from "@repo/adapters";
 import { resolveDeploymentRuntimeForRead } from "../../lib/deployment-runtime";
+import { livePrimaryContainerId } from "../services/service-container";
 import {
   resolveProjectTrafficSources,
   fetchMgmt,
@@ -543,7 +544,12 @@ export async function getDeploymentStats(
   });
 
   const total = deployments.length;
-  const success = deployments.filter((d) => d.status === "ready").length;
+  // `no_changes` counts as success: nothing failed, and the release it declined to
+  // replace is still live. Left out, every unchanged redeploy would lower the rate
+  // AND land in the `pending` residue below, which is `total - success - failed`.
+  const success = deployments.filter(
+    (d) => d.status === "ready" || d.status === "no_changes",
+  ).length;
   const failed = deployments.filter((d) => d.status === "failed").length;
 
   // Average build duration of successful deployments
@@ -597,7 +603,10 @@ export async function getDeploymentStats(
  * Container info (status, IP, uptime) for a project's primary container.
  *
  * Genuinely single-container by nature — this describes the deployment's own
- * container, not the stack — so it is not duplicating the usage collector.
+ * container, not the stack — so it is not duplicating the usage collector. Which
+ * container that is comes from `livePrimaryContainerId`, for the same reason the
+ * usage collector was rewritten: `deployment.containerId` names one service in
+ * dependency order, so it answered for the database (#498).
  *
  * Uses the READ-ONLY resolver: building a full platform here runs
  * `detectOpenRestyPaths` plus the edge-Lua self-heal inside the provision lock,
@@ -617,7 +626,8 @@ export async function getContainerInfo(ctx: RequestContext, projectId: string) {
 
   const { runtime } = await resolveDeploymentRuntimeForRead(dep);
   try {
-    return await runtime.getContainerInfo(dep.containerId);
+    const containerId = await livePrimaryContainerId(runtime, dep);
+    return containerId ? await runtime.getContainerInfo(containerId) : null;
   } finally {
     void Promise.resolve(runtime.dispose?.()).catch(() => {});
   }
@@ -638,7 +648,8 @@ export async function getDashboardStats(ctx: RequestContext) {
 
   let totalDeployments = 0;
   for (const count of Object.values(deploymentsByStatus)) totalDeployments += count;
-  const successDeployments = deploymentsByStatus["ready"] ?? 0;
+  const successDeployments =
+    (deploymentsByStatus["ready"] ?? 0) + (deploymentsByStatus["no_changes"] ?? 0);
   const failedDeployments = deploymentsByStatus["failed"] ?? 0;
 
   return {

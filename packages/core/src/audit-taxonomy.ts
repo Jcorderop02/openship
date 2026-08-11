@@ -113,6 +113,14 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     tone: "warning",
     description: "A deployment was stopped before it finished.",
   },
+  "deployment.no_changes": {
+    category: "deployments",
+    action: "found no changes to deploy for",
+    label: "No changes to deploy",
+    tone: "info",
+    description:
+      "A redeploy found every service already up to date, so the current release stayed live.",
+  },
   "deployment:write": {
     category: "deployments",
     action: "started a deploy for",
@@ -231,6 +239,14 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     tone: "success",
     description: "An outage ended and the container is healthy again.",
   },
+  "service.exec": {
+    category: "apps",
+    action: "ran a command in",
+    label: "Command executed in container",
+    tone: "warning",
+    description:
+      "A shell command was run inside a service's container. The command is recorded; its output is not, because output is unbounded and may contain secrets the command read.",
+  },
 
   /* ---------------- Domains & SSL ---------------- */
   "domain.added": {
@@ -278,6 +294,22 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     tone: "danger",
     description: "Automatic renewal failed — the certificate will expire unless this is fixed.",
   },
+  "dns_credential.connected": {
+    category: "domains",
+    action: "connected the DNS provider",
+    label: "DNS provider connected",
+    tone: "info",
+    description:
+      "An API token that lets Openship write this organization's DNS records was stored. The token itself is never recorded.",
+  },
+  "dns_credential.disconnected": {
+    category: "domains",
+    action: "disconnected the DNS provider",
+    label: "DNS provider disconnected",
+    tone: "warning",
+    description:
+      "Openship can no longer write DNS records for domains in that provider's zones; records already written are left in place.",
+  },
   "domain:write": {
     category: "domains",
     action: "changed the domain",
@@ -308,6 +340,14 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     action: "removed the server",
     label: "Server removed",
     tone: "danger",
+  },
+  "server.exec": {
+    category: "servers",
+    action: "ran a command on the server",
+    label: "Command executed",
+    tone: "warning",
+    description:
+      "A shell command was run on the host. The command is recorded; its output is not, because output is unbounded and may contain secrets the command read.",
   },
   "server.unreachable": {
     category: "servers",
@@ -474,6 +514,21 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     label: "Permission replaced",
     tone: "warning",
     description: "An existing grant was overwritten with a different scope.",
+  },
+  "mcp.authorized": {
+    category: "members",
+    action: "authorized the MCP client",
+    label: "MCP client authorized",
+    tone: "info",
+    description: "An AI agent was connected and given a scope to act within.",
+  },
+  "mcp.scope_changed": {
+    category: "members",
+    action: "changed the access of the MCP client",
+    label: "MCP access changed",
+    tone: "warning",
+    description:
+      "A connected agent's scope was edited. It takes effect on the agent's next request — no reconnect.",
   },
   "grant.materialized": {
     category: "members",
@@ -807,6 +862,7 @@ export const AUDIT_RESOURCE_LABELS: Record<string, string> = {
   container: "a container",
   deployment: "a deployment",
   domain: "a domain",
+  dns_credential: "a DNS provider",
   server: "a server",
   mail_server: "the mail server",
   job: "a job",

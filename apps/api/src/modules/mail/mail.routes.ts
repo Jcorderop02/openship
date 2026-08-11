@@ -5,7 +5,6 @@
  */
 
 import { Hono } from "hono";
-import { localOnly } from "../../middleware";
 import { secureRouter } from "../../lib/secure-router";
 import * as mail from "./mail.controller";
 import * as admin from "./admin/admin.controller";
@@ -15,9 +14,9 @@ const r = secureRouter(new Hono(), {
   module: "mail",
   basePath: "/api/mail",
   ids: { mail_server: "serverId" },
+  localOnly: true,
 });
 
-r.use("*", localOnly);
 
 /* ── Setup wizard ─────────────────────────────────────────────────── */
 r.get("/steps", { tag: "mail_server:read" }, mail.getSteps);
@@ -86,6 +85,18 @@ r.post(
   "/admin/:serverId/domains/:domain/dns/acknowledge",
   { tag: "mail_server:write" },
   admin.acknowledgeDomainDnsHandler,
+);
+// On-demand DNS auto-configure via a connected provider (Settings→DNS). Plan is
+// a read-only dry-run; apply writes the records on operator press (never on add).
+r.get(
+  "/admin/:serverId/domains/:domain/dns/plan",
+  { tag: "mail_server:read" },
+  admin.planDomainDnsHandler,
+);
+r.post(
+  "/admin/:serverId/domains/:domain/dns/apply",
+  { tag: "mail_server:write" },
+  admin.applyDomainDnsHandler,
 );
 r.get(
   "/admin/:serverId/domains-dns/pending",
