@@ -287,6 +287,13 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     label: "Certificate uploaded",
     description: "A certificate and key were supplied by hand instead of issued automatically.",
   },
+  "domain.dns_provisioned": {
+    category: "domains",
+    action: "auto-provisioned DNS for",
+    label: "DNS auto-provisioned",
+    tone: "success",
+    description: "Records were created through the connected DNS provider instead of by hand.",
+  },
   "ssl.renewal_failed": {
     category: "domains",
     action: "failed to renew SSL for",
